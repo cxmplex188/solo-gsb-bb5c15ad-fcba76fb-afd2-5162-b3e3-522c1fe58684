@@ -5,8 +5,11 @@
 - 时间窗为按 window_size_seconds 对齐 epoch 的滚动窗口。
 - 当 watermark >= window_end + allowed_lateness_seconds 时，窗口封存（sealed）。
 - 重复 (device_id, event_id) 幂等去重，不影响聚合结果。
-- 窗口封存后到达的事件标记为 late，仍计入聚合，同时生成一条修正记录，
-  窗口的 correction_count 随之递增。
+- 事件去重后的迟到判定有两个并列口径：目标窗口行已为 sealed 时一律按 late
+  （封存不可逆，即使之后调长 allowed_lateness_seconds、按当前水位线与新期限
+  尚未越线也不例外）；窗口尚无行或仍 open 时继续按水位线阈值
+  （watermark >= window_end + allowed_lateness_seconds）判定。late 事件仍计入
+  聚合，同时生成一条修正记录，窗口的 correction_count 随之递增。
 
 提交预演（dry-run，只读语义）：
 - POST /ingest/preview 接收与 POST /ingest 完全相同的设备与事件批次，在同一数据库快照
@@ -41,7 +44,8 @@
   同一写事务内封存水位线已越过新封存阈值（watermark >= window_end + 新迟到秒数）的
   已有 open 窗口并记录 sealed_at，且仅在实际封存时推进窗口检索的状态变更版本
   （进行中的 status 筛选翻页返回 409，未筛状态的游标不受影响）；调长迟到期限不会
-  重开已封存窗口，后续写入落入新封存窗口的事件按 late 修正处理。
+  重开已封存窗口——封存不可逆，此后落入任一 sealed 窗口的事件一律按 late 修正处理，
+  即使按调长后的新期限水位线尚未越线也不例外（尚无窗口行的位置仍只按水位线阈值判定）。
 - 旧库组成员纠偏：提交值与所有所属组一致时，写入前在同一写锁事务内核对该设备
   已有窗口的起点对齐与实际跨度；任一窗口与目标 window_size_seconds 不相容
   （漂移期间落盘的异网格窗口）即返回 409，设备配置、窗口与组汇总保持原样；
@@ -1378,8 +1382,22 @@ def _run_ingest_batch(
 
         w_start = window_floor(t, size)
         w_end = w_start + size
-        # 所属窗口已封存（水位线已越过 window_end + 允许迟到窗口）=> 迟到数据
-        is_late = watermark is not None and watermark >= w_end + lateness
+
+        # 迟到判定有两个并列口径，满足其一即为 late：
+        # 1) 目标窗口行已存在且状态为 sealed——封存不可逆，即使此后调长了
+        #    allowed_lateness_seconds、按当前水位线与新期限本不该封存，落入其中的
+        #    新事件仍按迟到修正入库（否则会漏掉封存后的修正与计数）；
+        # 2) 窗口尚无行或仍为 open 时，沿用水位线阈值：批内水位线（随前序事件
+        #    单调推进）已越过 window_end + 允许迟到窗口 => 迟到数据。
+        win_row = conn.execute(
+            "SELECT status FROM windows WHERE device_id = ? AND window_start = ?",
+            (req.device_id, w_start),
+        ).fetchone()
+        window_sealed = win_row is not None and win_row["status"] == "sealed"
+        past_lateness_threshold = (
+            watermark is not None and watermark >= w_end + lateness
+        )
+        is_late = window_sealed or past_lateness_threshold
         status = "late" if is_late else "accepted"
 
         conn.execute(
@@ -1554,7 +1572,8 @@ def put_device_config(device_id: str, cfg: DeviceConfig) -> DeviceOut:
       并记录 sealed_at——与 ingest 水位线推进后的封存同一条件口径；只有实际封存了
       窗口才推进窗口检索的状态变更版本（进行中的 status 筛选翻页将返回 409，未筛
       状态的游标不受影响）。调长迟到期限不会重开已封存窗口（封存只触及 open 行）；
-      后续写入落入新封存窗口的事件按 late 修正处理。
+      封存不可逆——ingest 侧对落入任一 sealed 窗口的事件一律按 late 修正处理，即使
+      按调长后的新期限水位线尚未越线，尚无窗口行的位置仍只按水位线阈值判定。
     - 已入组设备的窗口大小与允许迟到秒数必须与**每一个所属组**保持一致：
       任一组的窗口配置不同即返回 409 且不写入——即使该设备尚无任何窗口也不得改窗口
       大小（否则同组 window_start 时间范围错开），允许迟到秒数同样不得随时改
