@@ -7,6 +7,8 @@
   时游标不失效。
 - 调长 allowed_lateness_seconds：不重开已封存窗口（sealed_at 不变）。
 - 后续写入落入新封存窗口的事件按 late 修正处理（计入聚合、生成修正记录）。
+- 调长迟到期限后，即使按新期限水位线尚未越线，落入仍为 sealed 的旧窗口的
+  补报事件仍按 late 入库（不能因 deadline 变长而记为 accepted 漏掉修正）。
 """
 
 
@@ -162,6 +164,86 @@ def test_events_into_newly_sealed_window_are_late_corrections(client):
     assert len(corrections) == 1
     assert corrections[0]["event_id"] == "e3"
     assert corrections[0]["window_start"] == "2026-09-22T00:00:00Z"
+
+
+def test_widen_lateness_keeps_events_in_still_sealed_window_late(client):
+    # 短迟到期限（30s）下封存 [00:00,00:01)：水位线 00:02:00 越过 00:01:00+30
+    assert put_config(client, "d1", 60, 30).status_code == 200
+    ingest(client, "d1", "e1", "2026-09-22T00:00:10Z", value=1.0)
+    ingest(client, "d1", "e2", "2026-09-22T00:02:00Z", value=2.0)
+    assert [w["status"] for w in windows(client, "d1")] == ["sealed", "open"]
+
+    # 调长到 3600s：按新期限 00:01:00+3600 > 00:02:00，水位线尚未越线，
+    # 但旧窗口仍为 sealed —— 落入其中的补报必须按 late 修正而非 accepted
+    assert put_config(client, "d1", 60, 3600).status_code == 200
+
+    body = ingest(client, "d1", "e3", "2026-09-22T00:00:40Z", value=5.0).json()
+    assert (body["accepted"], body["late"]) == (0, 1)
+    assert body["results"][0]["status"] == "late"
+    assert body["results"][0]["window_start"] == "2026-09-22T00:00:00Z"
+
+    w = windows(client, "d1")[0]
+    assert w["status"] == "sealed"
+    assert (w["count"], w["sum"]) == (2, 6.0)
+    assert (w["correction_count"], w["late_event_count"]) == (1, 1)
+
+    corrections = client.get("/devices/d1/corrections").json()
+    assert [c["event_id"] for c in corrections] == ["e3"]
+
+    # 同一 event_id 重试仍幂等去重，不重复累计修正
+    again = ingest(client, "d1", "e3", "2026-09-22T00:00:40Z", value=5.0).json()
+    assert (again["accepted"], again["late"], again["duplicates"]) == (0, 0, 1)
+    w = windows(client, "d1")[0]
+    assert (w["count"], w["correction_count"], w["late_event_count"]) == (2, 1, 1)
+
+
+def test_widen_lateness_preview_matches_commit_for_still_sealed_window(client):
+    assert put_config(client, "d1", 60, 30).status_code == 200
+    ingest(client, "d1", "e1", "2026-09-22T00:00:10Z", value=1.0)
+    ingest(client, "d1", "e2", "2026-09-22T00:02:00Z", value=2.0)
+    assert put_config(client, "d1", 60, 3600).status_code == 200
+
+    batch = [
+        {"event_id": "e3", "event_time": "2026-09-22T00:00:40Z", "value": 5.0},  # sealed 窗口 => late
+        {"event_id": "e4", "event_time": "2026-09-22T00:02:10Z", "value": 3.0},  # open 窗口 => accepted
+    ]
+    prev = client.post("/ingest/preview", json={"device_id": "d1", "events": batch})
+    assert prev.status_code == 200
+    pbody = prev.json()
+    assert [(x["event_id"], x["status"]) for x in pbody["results"]] == [
+        ("e3", "late"), ("e4", "accepted"),
+    ]
+    sealed = next(w for w in pbody["windows"] if w["window_start"] == "2026-09-22T00:00:00Z")
+    assert (sealed["status"], sealed["count"], sealed["sum"], sealed["correction_count"]) == (
+        "sealed", 2, 6.0, 1,
+    )
+
+    committed = client.post("/ingest", json={"device_id": "d1", "events": batch}).json()
+    assert [(x["event_id"], x["status"], x["window_start"]) for x in committed["results"]] == [
+        (x["event_id"], x["status"], x["window_start"]) for x in pbody["results"]
+    ]
+    assert (committed["accepted"], committed["late"]) == (pbody["accepted"], pbody["late"])
+
+    w = windows(client, "d1")[0]
+    assert (w["status"], w["count"], w["sum"], w["correction_count"]) == (
+        "sealed", 2, 6.0, 1,
+    )
+
+
+def test_widen_lateness_still_uses_watermark_when_window_absent(client):
+    # 尚无窗口时继续按水位线阈值判定：调长后旧事件时间位置无窗口 => accepted 新建
+    assert put_config(client, "d1", 60, 30).status_code == 200
+    ingest(client, "d1", "e2", "2026-09-22T00:05:00Z", value=2.0)  # 水位线 00:05:00
+    assert put_config(client, "d1", 60, 3600).status_code == 200
+
+    # 窗口 [00:02,00:03) 此前无任何事件（无记录）；按新期限 00:03:00+3600 > 水位线
+    # => accepted 并新建 open 窗口，而不是仅因水位线较晚就记 late
+    body = ingest(client, "d1", "e3", "2026-09-22T00:02:10Z", value=4.0).json()
+    assert (body["accepted"], body["late"]) == (1, 0)
+    by_start = {w["window_start"]: w for w in windows(client, "d1")}
+    w = by_start["2026-09-22T00:02:00Z"]
+    assert (w["status"], w["count"], w["sum"]) == ("open", 1, 4.0)
+    assert (w["correction_count"], w["late_event_count"]) == (0, 0)
 
 
 def test_config_update_on_device_without_data(client):

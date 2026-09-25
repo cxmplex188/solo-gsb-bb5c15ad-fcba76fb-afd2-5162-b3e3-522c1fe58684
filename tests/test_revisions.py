@@ -312,3 +312,53 @@ def test_startup_backfills_single_baseline_at_current_revision(tmp_path, monkeyp
         assert [r["kind"] for r in revs2] == ["baseline", "revision"]
         assert revs2[0]["value"] == 35.0
         assert revs2[1]["value"] == 37.0
+
+
+def test_late_correction_after_widening_lateness_bumps_ready_group_revision(client):
+    # 两设备在入组前以短迟到期限（30s）封存 [00:00,00:01)，随后都调长到 3600s：
+    # 按新期限水位线尚未越线，但旧窗口仍为 sealed。
+    for device_id, value in (("d1", 10.0), ("d2", 20.0)):
+        client.put(f"/devices/{device_id}/config", json={
+            "window_size_seconds": 60, "allowed_lateness_seconds": 30,
+        })
+        ingest(client, device_id, [
+            {"event_id": "e1", "event_time": "2026-09-22T00:00:10Z", "value": value},
+        ])
+        ingest(client, device_id, [
+            {"event_id": f"seal-{device_id}", "event_time": "2026-09-22T00:02:00Z", "value": 99.0},
+        ])
+        client.put(f"/devices/{device_id}/config", json={
+            "window_size_seconds": 60, "allowed_lateness_seconds": 3600,
+        })
+
+    r = client.post("/groups", json={
+        "group_id": "g1", "member_ids": ["d1", "d2"], "aggregation": "sum",
+        "window_size_seconds": 60, "allowed_lateness_seconds": 3600,
+    })
+    assert r.status_code == 201
+
+    gw = client.get("/groups/g1/windows/2026-09-22T00:00:00Z").json()
+    assert gw["status"] == "ready" and gw["revision"] == 1
+    assert gw["value"] == 30.0
+
+    # 落入仍 sealed 的旧窗口（按新期限 deadline 未到）：late 修正并走既有升版机制
+    body = ingest(client, "d1", [
+        {"event_id": "late-1", "event_time": "2026-09-22T00:00:30Z", "value": 5.0},
+    ]).json()
+    assert body["results"][0]["status"] == "late"
+
+    gw2 = client.get("/groups/g1/windows/2026-09-22T00:00:00Z").json()
+    assert gw2["status"] == "ready"
+    assert gw2["revision"] == 2
+    assert gw2["value"] == 35.0  # d1: 10+5, d2: 20
+
+    revs = client.get("/groups/g1/windows/2026-09-22T00:00:00Z/revisions").json()
+    assert [x["revision"] for x in revs] == [1, 2]
+    assert [x["value"] for x in revs] == [30.0, 35.0]
+
+    # 同一 event_id 重试：去重不产生新修正，revision 保持 2
+    ingest(client, "d1", [
+        {"event_id": "late-1", "event_time": "2026-09-22T00:00:30Z", "value": 5.0},
+    ])
+    gw3 = client.get("/groups/g1/windows/2026-09-22T00:00:00Z").json()
+    assert gw3["revision"] == 2 and gw3["value"] == 35.0

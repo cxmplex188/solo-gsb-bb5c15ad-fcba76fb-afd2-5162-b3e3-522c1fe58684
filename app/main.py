@@ -5,8 +5,11 @@
 - 时间窗为按 window_size_seconds 对齐 epoch 的滚动窗口。
 - 当 watermark >= window_end + allowed_lateness_seconds 时，窗口封存（sealed）。
 - 重复 (device_id, event_id) 幂等去重，不影响聚合结果。
-- 窗口封存后到达的事件标记为 late，仍计入聚合，同时生成一条修正记录，
-  窗口的 correction_count 随之递增。
+- 去重后满足任一条件的事件标记为 late：目标窗口记录已存在且为 sealed（调长
+  allowed_lateness_seconds 不会重开已封存窗口，故即使按新期限水位线尚未越线，
+  落入其中的补报仍是迟到修正）；或尚无窗口（窗口仍 open）时水位线已越过
+  window_end + allowed_lateness_seconds。late 事件仍计入聚合，同时生成一条修正
+  记录，窗口的 correction_count 随之递增。
 
 提交预演（dry-run，只读语义）：
 - POST /ingest/preview 接收与 POST /ingest 完全相同的设备与事件批次，在同一数据库快照
@@ -1378,8 +1381,19 @@ def _run_ingest_batch(
 
         w_start = window_floor(t, size)
         w_end = w_start + size
-        # 所属窗口已封存（水位线已越过 window_end + 允许迟到窗口）=> 迟到数据
-        is_late = watermark is not None and watermark >= w_end + lateness
+        # 迟到判定（两条口径取其一）：
+        # 1) 目标窗口已封存：sealed 不会因调长 allowed_lateness_seconds 而重开，
+        #    即使当前水位线按新期限尚未越过 window_end + lateness，落入其中的事件
+        #    仍是迟到修正（否则调长迟到期限后会把旧 sealed 窗口的补报错记为 accepted）；
+        # 2) 尚无窗口（或窗口仍 open）时沿用水位线阈值：watermark >= window_end + lateness。
+        existing_win = conn.execute(
+            "SELECT status FROM windows WHERE device_id = ? AND window_start = ?",
+            (req.device_id, w_start),
+        ).fetchone()
+        if existing_win is not None and existing_win["status"] == "sealed":
+            is_late = True
+        else:
+            is_late = watermark is not None and watermark >= w_end + lateness
         status = "late" if is_late else "accepted"
 
         conn.execute(
